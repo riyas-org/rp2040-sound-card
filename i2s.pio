@@ -1,0 +1,196 @@
+; Tired of Bit slips which change side with a nop 
+; i2s.pio  —  RP2040 I2S master TX + IRQ-synchronised RX
+;
+; Design goals (128 MHz system clock, WM8731 slave, 32-bit stereo):
+;
+;   • Both state machines run at IDENTICAL clock dividers (BCK × 2).
+;   • TX SM drives BCLK/LRCK/SDO and fires IRQ 4 on every BCK rising edge
+;     at which SDI is valid (i.e. every bit-sample point).
+;   • RX SM waits on IRQ 4 instead of polling the BCK pin.  This makes
+;     sampling completely edge-locked — there is no polling race and no
+;     oversampling required.
+;   • Both SMs are started with pio_enable_sm_mask_in_sync() so they are
+;     phase-aligned from cycle 0.
+;
+; Clock dividers (128 MHz):
+;   div = 128_000_000 / (fs × 64 × 2)
+;   48 kHz → div = 20 + 213/256  (≈ 20.832)   BCK error < 0.004 %
+;   96 kHz → div = 10 + 107/256  (≈ 10.418)   BCK error < 0.004 %
+;
+; Pin layout (consecutive, required by RX SM):
+;   GP2  SDI   din_pin_base + 0   WM8731 → RP2040
+;   GP3  BCLK  din_pin_base + 1   RP2040 → WM8731  (clock_pin_base + 0)
+;   GP4  LRCK  din_pin_base + 2   RP2040 → WM8731  (clock_pin_base + 1)
+;   GP5  SDO   dout_pin           RP2040 → WM8731
+;
+; IRQ 4 is used for TX→RX synchronisation.  It is a relative (sm-local)
+; IRQ so it does not conflict with any CPU-side IRQ handlers.
+;
+; ---------------------------------------------------------------------------
+; I2S Output Master  (TX)
+; ---------------------------------------------------------------------------
+; Drives SDO, BCLK, LRCK.  Fires irq 4 on every BCK rising edge so the
+; RX SM can sample SDI at exactly the right moment without polling.
+;
+; Instruction timing (each instruction = 1 PIO clock = ½ BCK period):
+;   BCK LOW  half:  "out pins, 1  side 0bL0"  — data presented, BCK low
+;   BCK HIGH half:  "irq  4 / jmp side 0bL1"  — BCK rises, IRQ fires → RX samples
+;
+; side-set: bit1 = LRCK, bit0 = BCLK
+
+.program i2s_out_master
+.side_set 2
+
+public entry_point:
+frameL:
+    set  x, 31          side 0b00    ; Prepare 32 bits
+    pull noblock        side 0b01    ; LRCK=0, BCLK=1
+    irq  4              side 0b01    ; Sync for 'delay' bit
+dataL:
+    out  pins, 1        side 0b00     ; BCK Low (2 cycles)
+    irq  4              side 0b01 [1]    ; BCK High (Start handshake)
+    jmp  x-- dataL      side 0b01     ; BCK High (Handshake completes)
+
+frameR:
+    set  x, 31          side 0b10    ; Prepare 32 bits
+    pull noblock        side 0b11    ; LRCK=1, BCLK=1
+    irq  4              side 0b11    ; Sync for 'delay' bit
+dataR:
+    out  pins, 1        side 0b10    ; FIXED: Added [1] to match dataL
+    irq  4              side 0b11 [1] 
+    jmp  x-- dataR      side 0b11
+    
+; ---------------------------------------------------------------------------
+; I2S Input  (RX) — IRQ-synchronised
+; ---------------------------------------------------------------------------
+; Waits for IRQ 4 (fired by TX SM on every BCK rising edge) then immediately
+; samples SDI.  Because the TX SM fires the IRQ in the same PIO clock that
+; BCK goes high, and both SMs run at the same divider, the RX SM executes
+; "in pins, 1" exactly 1 PIO clock after BCK rises — well within the WM8731
+; ADCDAT hold window (≥ 10 ns; 1 PIO clock @ 128 MHz = 7.8 ns + GPIO
+; synchroniser latency ≈ 2 clocks → ~15 ns total from BCK edge to sample).
+;
+; Frame sync uses LRCK directly (jmp pin = LRCK) so it is immune to BCK
+; count errors.  push noblock is used so a full RX FIFO stall cannot cause
+; a bit-slip — the push is discarded rather than hanging the SM.
+;
+; Startup: wait for LRCK 1→0 transition, then consume the left-frame
+; delay-BCK IRQ so the bit counter starts at MSB (bit 31).
+
+.program i2s_in_slave
+
+public entry_point:
+    wait 1 pin 2                 ; Wait for LRCK High
+    wait 0 pin 2                 ; Wait for LRCK Low (Start of Left)
+    wait 1 irq 4                 ; Consume Left frame delay IRQ
+
+main_loop:
+; ---- Left frame ----
+    set  x, 31                   ; Expect 32 bits
+sample_l:
+    wait 1 irq 4                 ; Wait for BCK rising
+    in   pins, 1                 ; Sample
+    jmp  x-- sample_l
+    push noblock                 ; Push Left sample
+    wait 1 irq 4                 ; Consume Right frame delay IRQ
+
+; ---- Right frame ----
+    set  x, 31                   ; Expect 32 bits
+sample_r:
+    wait 1 irq 4
+    in   pins, 1
+    jmp  x-- sample_r
+    push noblock                 ; Push Right sample
+    wait 1 irq 4                 ; Consume next Left frame delay IRQ
+    jmp  main_loop               ; Repeat
+    
+    
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+/* ---------------------------------------------------------------------------
+ * Clock note (128 MHz):
+ *
+ *   Both TX and RX state machines run at the SAME divider:
+ *       div = sys_clk / (fs * 64 * 2)
+ *
+ *   At 128 MHz / 48 kHz:  div = 128e6 / 6144000  = 20 + 213/256
+ *   At 128 MHz / 96 kHz:  div = 128e6 / 12288000 = 10 + 107/256
+ *
+ *   The RX SM no longer needs 4× or 8× oversampling because it is
+ *   synchronised to the TX SM via IRQ 4, not by polling BCK.
+ * --------------------------------------------------------------------------*/
+//static const int i2s_pio_mult = 2;   /* PIO clocks per BCK edge, both SMs */
+
+/* ---------------------------------------------------------------------------
+ * i2s_out_master_program_init
+ *
+ *   pio            – PIO block (must be the same one used for RX)
+ *   sm             – state machine index
+ *   offset         – program offset from pio_add_program()
+ *   bit_depth      – audio bit depth (32 for WM8731 IWL_32BIT)
+ *   dout_pin       – GP number of SDO  (RP2040 → codec)
+ *   clock_pin_base – GP number of BCLK; LRCK = clock_pin_base + 1
+ * --------------------------------------------------------------------------*/
+static inline void i2s_out_master_program_init(PIO pio, uint sm, uint offset,
+                                               uint bit_depth,
+                                               uint dout_pin,
+                                               uint clock_pin_base)
+{
+    pio_gpio_init(pio, dout_pin);
+    pio_gpio_init(pio, clock_pin_base);
+    pio_gpio_init(pio, clock_pin_base + 1);
+
+    pio_sm_config c = i2s_out_master_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, dout_pin, 1);
+    sm_config_set_sideset_pins(&c, clock_pin_base);
+    /* MSB-first, no auto-pull, threshold = bit_depth */
+    sm_config_set_out_shift(&c, false, false, bit_depth);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    pio_sm_init(pio, sm, offset, &c);
+
+    /* All three pins are outputs */
+    uint32_t mask = (1u << dout_pin) | (3u << clock_pin_base);
+    pio_sm_set_pins_with_mask(pio, sm, 0u, mask);
+    pio_sm_set_pindirs_with_mask(pio, sm, mask, mask);
+}
+
+/* ---------------------------------------------------------------------------
+ * i2s_in_slave_program_init
+ *
+ *   din_pin_base – GP number of SDI (codec → RP2040).
+ *                  BCLK must be at din_pin_base + 1.
+ *                  LRCK must be at din_pin_base + 2.
+ *
+ * IMPORTANT: call AFTER i2s_out_master_program_init.  BCLK and LRCK are
+ * already configured as outputs by that call; this function only touches SDI.
+ * --------------------------------------------------------------------------*/
+static inline void i2s_in_slave_program_init(PIO pio, uint sm, uint offset,
+                                                  uint din_pin_base)
+{
+    /* Only claim the DIN pin; BCLK and LRCK belong to the TX SM. */
+    pio_gpio_init(pio, din_pin_base);
+    gpio_set_pulls(din_pin_base, false, false);   /* no pull — codec drives it */
+
+    pio_sm_config c = i2s_in_slave_program_get_default_config(offset);
+
+    /* Input pin base: SDI=+0, BCLK=+1, LRCK=+2 (consecutive, required) */
+    sm_config_set_in_pins(&c, din_pin_base);
+
+    /* JMP pin = LRCK (din_pin_base + 2) — used to detect frame boundaries */
+    sm_config_set_jmp_pin(&c, din_pin_base + 2);
+
+    /* Shift left (MSB first), no auto-push, threshold = 32.
+     * push noblock is explicit in the program; autopush is OFF.
+     * Threshold = 32 (not 0) avoids any ambiguity in the SDK macro. */
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    /* Set SDI as input only — leave BCLK and LRCK as outputs (TX SM owns them) */
+    uint32_t din_mask = (1u << din_pin_base);
+    pio_sm_set_pindirs_with_mask(pio, sm, 0u, din_mask);
+}
+%}
