@@ -16,6 +16,8 @@ This project implements a USB Audio Class 2.0 (UAC2) stereo audio interface with
 
 ## Hardware Requirements
 
+<img src="build/Image_1778764335239.jpg" alt="Test Hardware" title="This is my terrible test bench, but it works well :)" width="500">
+
 ### RP2040 Board
 - Raspberry Pi Pico or compatible RP2040 board
 
