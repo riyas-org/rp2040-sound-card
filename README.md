@@ -1,21 +1,5 @@
 # USB Audio Stereo SDR with WM8731 Codec
 
-
-
-## 🚧 Status: Work in Progress
-```text
-  _______________________________________________
- |                                               |
- |    STATUS: UNFINISHED                         |
- |                                               |
- |    [#######----------] 50%                    |
- |                                               |
- |    - PLAYBACK:    [ OK ]                      |
- |    - MIC CAPTURE: [ BUGGY / UNSTABLE ]        |
- |_______________________________________________|
-
-```
-
 This project implements a USB Audio Class 2.0 (UAC2) stereo audio interface with CDC (serial) support for Software Defined Radio (SDR) applications using the Raspberry Pi Pico (RP2040) and WM8731 audio codec.
 
 ## Features
@@ -23,8 +7,8 @@ This project implements a USB Audio Class 2.0 (UAC2) stereo audio interface with
 - **Stereo Audio**: 2-channel I/Q audio input and output for SDR applications
 - **USB Audio Class 2.0**: Compatible with Linux, macOS, and Windows (with drivers)
 - **WM8731 Codec**: Professional audio codec with I2S interface
-- **Multiple Sample Rates**: 44.1kHz, 48kHz, up to 96kHz
-- **Multiple Bit Depths**: 16-bit and 24-bit audio
+- **Sample Rate**: Fixed 48kHz
+- **Bit Depth**: 24-bit audio
 - **CDC Serial Port**: Debug/control interface
 - **DMA Transfers**: Non-blocking audio transfers for low latency
 - **Volume Control**: USB volume and mute controls
@@ -73,7 +57,7 @@ Key settings for stereo operation:
 ```c
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX    2  // Stereo microphone (I/Q input)
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX    2  // Stereo speaker (I/Q output)
-#define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE  96000  // Maximum sample rate
+#define CFG_TUD_AUDIO_FUNC_1_MAX_SAMPLE_RATE  48000  // Maximum sample rate
 ```
 
 ### WM8731 Configuration (wm8731.h)

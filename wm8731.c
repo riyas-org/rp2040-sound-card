@@ -1,26 +1,29 @@
 /*
- * WM8731 Audio Codec Driver Implementation for RP2040
+ * The MIT License (MIT)
  *
- * Key changes from the previous version:
+ * Copyright (c) 2020 Jerzy Kasenberg
+ * Copyright (c) 2022 Angel Molina 
+ * Copyright (c) 2023 Dhiru Kholia 
+ * Copyright (c) 2026 Riyas Vettukattil  
+ 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
  *
- *  1. Pin layout changed: SDI moved to GP2, MCLK moved to GP6.
- *     GP2=SDI, GP3=BCLK, GP4=LRCK must be consecutive for i2s_in_slave.
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
  *
- *  2. PIO programs replaced:
- *     - TX: i2s_out_master  – RP2040 generates BCLK and LRCK (master mode).
- *     - RX: i2s_in_slave    – samples SDI by polling BCLK/LRCK at 4x BCK.
- *     Both SMs are started together with pio_enable_sm_mask_in_sync() so
- *     they are phase-locked and can never drift relative to each other.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  *
- *  3. DMA changed from 2 channels (simple reload-in-IRQ) to 4 channels
- *     (chained control-block double-buffering, after Collins):
- *       dma_tx_ctrl + dma_tx_data  – TX path (app buffer -> PIO TX FIFO)
- *       dma_rx_ctrl + dma_rx_data  – RX path (PIO RX FIFO -> app buffer)
- *     The ctrl channels reload the data channel addresses automatically so
- *     the IRQ handler only needs to update the tracking variables and flags.
- *
- *  4. The IRQ handler is now interrupt-minimal: no DMA register writes,
- *     just flag + index updates.
  */
 
 #include "wm8731.h"
@@ -134,7 +137,7 @@ static bool wm8731_i2c_init(void) {
  * USB-mode setting in the WM8731 sampling register (which we do).
  * ========================================================================= */
 
-static void wm8731_setup_mclk120(void) {
+static void wm8731_setup_mclk(void) {
     gpio_set_function(WM8731_MCLK_PIN, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(WM8731_MCLK_PIN);
     pwm_config cfg = pwm_get_default_config();
@@ -142,19 +145,6 @@ static void wm8731_setup_mclk120(void) {
     pwm_config_set_wrap(&cfg, 9);           /* 120 MHz / 10 = 12 MHz         */
     pwm_init(slice, &cfg, true);
     pwm_set_gpio_level(WM8731_MCLK_PIN, 5); /* 50 % duty cycle               */
-}
-
-static void wm8731_setup_mclk(void) {
-    gpio_set_function(WM8731_MCLK_PIN, GPIO_FUNC_PWM);
-    uint slice = pwm_gpio_to_slice_num(WM8731_MCLK_PIN);
-    pwm_config cfg = pwm_get_default_config();
-    pwm_config_set_clkdiv(&cfg, 1.0f);
-    
-    // CHANGE: 147.6 MHz / (11 + 1) = 12.3 MHz
-    pwm_config_set_wrap(&cfg, 10); 
-    
-    pwm_init(slice, &cfg, true);
-    pwm_set_gpio_level(WM8731_MCLK_PIN, 6); // 50% duty cycle
 }
 
 /* =========================================================================
@@ -207,35 +197,16 @@ static void wm8731_setup_i2s_pio(uint32_t sample_rate) {
 void wm8731_set_i2s_samplerate(uint32_t sample_rate) {
     float sys_hz = (float)clock_get_hz(clk_sys);
 
-    /*
-     * The i2s_out_master loop body takes 3 PIO clocks per BCK period:
-     *   cycle 0: out pins, 1  side BCK=0  (BCK low, data presented)
-     *   cycle 1: irq  4       side BCK=1  (BCK rises, RX samples)
-     *   cycle 2: jmp  x--     side BCK=1  (BCK high hold)
-     *
-     * BCK = fs * 64, so PIO must tick at fs * 64 * 3.
-     *   div = sys_clk / (fs * 64 * 3)
-     *
-     * At 147.6 MHz / 48 kHz:  div = 147600000 / 9216000  = 16.015625 (exact)
-     * At 147.6 MHz / 96 kHz:  div = 147600000 / 18432000 =  8.0078125 (exact)
-     *
-     * The old code used fs*256 which produced BCK at 4x the correct rate,
-     * making recorded audio play back at 2x speed (chipmunk effect).
-     *
-     * RX SM runs at the same divider. It spends nearly all its time stalled
-     * in `wait 1 irq 4`, so the divider only needs to guarantee that
-     * `in pins, 1` completes before the next irq 4 fires. At the same
-     * divider this is guaranteed with >1 PIO clock of margin.
-     */
-    float div = sys_hz / ((float)sample_rate * 256.0f );
+    /* TX: out_master needs 2 PIO clocks per BCK edge; BCK = fs * 64 */
+    float div_tx = sys_hz / ((float)sample_rate * 64.0f * 2.0f);
 
-    cdc_printf("DEBUG: samplerate=%lu sys_hz=%.0f div=%.6f\n",
-               sample_rate, sys_hz, (double)div);
+    /* RX: in_slave polls at 4x BCK = SCK = fs * 256; 2 PIO clocks per SCK */
+    float div_rx = sys_hz / ((float)sample_rate * 256.0f * 2.0f);
 
-    pio_sm_set_clkdiv(I2S_PIO, sm_tx, div);
-    pio_sm_set_clkdiv(I2S_PIO, sm_rx, div);
+    pio_sm_set_clkdiv(I2S_PIO, sm_tx, div_tx);
+    pio_sm_set_clkdiv(I2S_PIO, sm_rx, div_rx);
 
-    /* Restart both dividers simultaneously so they are phase-aligned */
+    /* Restart both dividers simultaneously so phase is aligned */
     pio_sm_clkdiv_restart(I2S_PIO, sm_mask);
 }
 
@@ -267,8 +238,8 @@ bool wm8731_configure(uint32_t sample_rate) {
     ok &= wm8731_write_reg(WM8731_REG_RLINE_IN, 0x017);
 
     /* Headphone output volume */
-    ok &= wm8731_write_reg(WM8731_REG_LHPHONE_OUT, 0x5F);
-    ok &= wm8731_write_reg(WM8731_REG_RHPHONE_OUT, 0x5F);
+    ok &= wm8731_write_reg(WM8731_REG_LHPHONE_OUT, 0x05F);
+    ok &= wm8731_write_reg(WM8731_REG_RHPHONE_OUT, 0x05F);
 
     /* Analog path: DAC selected, line in selected, mic boost off */
     ok &= wm8731_write_reg(WM8731_REG_ANALOG_PATH,
@@ -286,13 +257,12 @@ bool wm8731_configure(uint32_t sample_rate) {
     ok &= wm8731_write_reg(WM8731_REG_DIGITAL_IF,
                            WM8731_FORMAT_I2S | WM8731_IWL_32BIT);
 
-    
-	/* Sampling control – Normal mode (better for 147.6MHz) */
-    uint16_t sampling = 0x00; // Normal Mode (bit 0 = 0), 48kHz (SR bits = 0000)
-    
-    // If you need 96kHz, set SR bits to 0111 (0x1C)
+    /* Sampling control – USB mode */
+    uint16_t sampling;
     if (sample_rate == 96000) {
-        sampling = (0x07 << 2); 
+        sampling = (0x07 << 2) | WM8731_USB_MODE;   /* SR=0111, USB=1 */
+    } else {
+        sampling = WM8731_SR_48K_NORMAL | WM8731_USB_MODE; /* SR=0000, USB=1 */
     }
     ok &= wm8731_write_reg(WM8731_REG_SAMPLING, sampling);
 
@@ -527,11 +497,6 @@ void wm8731_start_dma(void) {
      * all selected SMs can be released together on the same PIO clock edge.
      */
     pio_enable_sm_mask_in_sync(I2S_PIO, sm_mask);
-    
-    //sleep_us(200);
-    
-    //dma_channel_start(dma_tx_ctrl);
-    //dma_channel_start(dma_rx_ctrl);
 }
 
 /* =========================================================================
